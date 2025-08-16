@@ -1,0 +1,306 @@
+name: Security Scanning and Compliance
+
+on:
+  schedule:
+    # Run security scans daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+
+jobs:
+  # Static code analysis
+  code-security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run CodeQL Analysis
+        uses: github/codeql-action/init@v3
+        with:
+          languages: java, javascript, go
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+      - name: Run Semgrep
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/secrets
+            p/owasp-top-ten
+            p/dockerfile
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+  # Dependency vulnerability scanning
+  dependency-scan:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [ui, catalog, cart, checkout, orders]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21 (for Java services)
+        if: matrix.service == 'ui' || matrix.service == 'cart' || matrix.service == 'orders'
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'corretto'
+
+      - name: Set up Go (for Go services)
+        if: matrix.service == 'catalog'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Set up Node.js (for Node services)
+        if: matrix.service == 'checkout'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run Snyk to check for vulnerabilities (Java)
+        if: matrix.service == 'ui' || matrix.service == 'cart' || matrix.service == 'orders'
+        uses: snyk/actions/maven@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --file=src/${{ matrix.service }}/pom.xml --severity-threshold=high
+
+      - name: Run Snyk to check for vulnerabilities (Go)
+        if: matrix.service == 'catalog'
+        uses: snyk/actions/golang@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --file=src/${{ matrix.service }}/go.mod --severity-threshold=high
+
+      - name: Run Snyk to check for vulnerabilities (Node.js)
+        if: matrix.service == 'checkout'
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --file=src/${{ matrix.service }}/package.json --severity-threshold=high
+
+  # Container image security scanning
+  container-scan:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        service: [ui, catalog, cart, checkout, orders]
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Scan ECR images with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.ECR_REGISTRY }}/retail-store-${{ matrix.service }}:latest
+          format: 'sarif'
+          output: 'trivy-results-${{ matrix.service }}.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results-${{ matrix.service }}.sarif'
+
+      - name: Run Grype vulnerability scanner
+        uses: anchore/scan-action@v3
+        with:
+          image: ${{ env.ECR_REGISTRY }}/retail-store-${{ matrix.service }}:latest
+          fail-build: true
+          severity-cutoff: high
+
+  # Infrastructure security scanning
+  infrastructure-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Checkov
+        id: checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: dockerfile,kubernetes,github_actions
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+
+      - name: Upload Checkov scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-results.sarif
+
+      - name: Run TruffleHog OSS
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: main
+          head: HEAD
+          extra_args: --debug --only-verified
+
+  # License compliance check
+  license-scan:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [ui, catalog, cart, checkout, orders]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21 (for Java services)
+        if: matrix.service == 'ui' || matrix.service == 'cart' || matrix.service == 'orders'
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'corretto'
+
+      - name: Set up Go (for Go services)
+        if: matrix.service == 'catalog'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Set up Node.js (for Node services)
+        if: matrix.service == 'checkout'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install license-checker for Node.js
+        if: matrix.service == 'checkout'
+        run: npm install -g license-checker
+
+      - name: Check licenses (Node.js)
+        if: matrix.service == 'checkout'
+        working-directory: src/${{ matrix.service }}
+        run: |
+          yarn install --frozen-lockfile
+          license-checker --onlyAllow 'MIT;Apache-2.0;BSD-2-Clause;BSD-3-Clause;ISC;0BSD'
+
+      - name: Install go-licenses for Go
+        if: matrix.service == 'catalog'
+        run: go install github.com/google/go-licenses@latest
+
+      - name: Check licenses (Go)
+        if: matrix.service == 'catalog'
+        working-directory: src/${{ matrix.service }}
+        run: |
+          go mod download
+          go-licenses check ./...
+
+      - name: Check licenses (Java)
+        if: matrix.service == 'ui' || matrix.service == 'cart' || matrix.service == 'orders'
+        working-directory: src/${{ matrix.service }}
+        run: |
+          ./mvnw org.codehaus.mojo:license-maven-plugin:2.0.0:check
+
+  # Security policy compliance
+  compliance-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for security policy
+        run: |
+          if [ ! -f "SECURITY.md" ]; then
+            echo "::warning::SECURITY.md file not found. Consider adding a security policy."
+          fi
+
+      - name: Check for dependency update automation
+        run: |
+          if [ ! -f ".github/dependabot.yml" ]; then
+            echo "::warning::Dependabot configuration not found. Consider enabling automated dependency updates."
+          fi
+
+      - name: Validate GitHub Actions workflows
+        uses: docker://rhysd/actionlint:latest
+        with:
+          args: -color
+
+  # Generate security report
+  security-report:
+    needs: [code-security-scan, dependency-scan, container-scan, infrastructure-scan, license-scan, compliance-check]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate Security Summary
+        run: |
+          echo "# Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.code-security-scan.result }}" == "success" ]; then
+            echo "✅ Code Security Scan: PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Code Security Scan: FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.dependency-scan.result }}" == "success" ]; then
+            echo "✅ Dependency Scan: PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Dependency Scan: FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.container-scan.result }}" == "success" ]; then
+            echo "✅ Container Scan: PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Container Scan: FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.infrastructure-scan.result }}" == "success" ]; then
+            echo "✅ Infrastructure Scan: PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Infrastructure Scan: FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.license-scan.result }}" == "success" ]; then
+            echo "✅ License Compliance: PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ License Compliance: FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.compliance-check.result }}" == "success" ]; then
+            echo "✅ Compliance Check: PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Compliance Check: FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Recommendations" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Review security findings in the Security tab" >> $GITHUB_STEP_SUMMARY
+          echo "- Update dependencies with known vulnerabilities" >> $GITHUB_STEP_SUMMARY
+          echo "- Ensure all container images are regularly updated" >> $GITHUB_STEP_SUMMARY
+          echo "- Monitor for new security advisories" >> $GITHUB_STEP_SUMMARY
