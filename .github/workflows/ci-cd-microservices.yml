@@ -1,0 +1,304 @@
+name: Microservices CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'src/**'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+  workflow_dispatch:
+    inputs:
+      force_build_all:
+        description: 'Force build all services'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+
+jobs:
+  # Job to detect which services have changed
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      ui: ${{ steps.changes.outputs.ui }}
+      catalog: ${{ steps.changes.outputs.catalog }}
+      cart: ${{ steps.changes.outputs.cart }}
+      checkout: ${{ steps.changes.outputs.checkout }}
+      orders: ${{ steps.changes.outputs.orders }}
+      any_changed: ${{ steps.changes.outputs.any_changed }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changes
+        uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            ui:
+              - 'src/ui/**'
+            catalog:
+              - 'src/catalog/**'
+            cart:
+              - 'src/cart/**'
+            checkout:
+              - 'src/checkout/**'
+            orders:
+              - 'src/orders/**'
+            any_changed:
+              - 'src/**'
+
+  # Build and push Docker images for changed services
+  build-and-push:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.any_changed == 'true' || github.event.inputs.force_build_all == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - service: ui
+            path: src/ui
+            dockerfile: src/ui/Dockerfile
+            build_args: ""
+            changed: ${{ needs.detect-changes.outputs.ui }}
+          - service: catalog
+            path: src/catalog
+            dockerfile: src/catalog/Dockerfile
+            build_args: ""
+            changed: ${{ needs.detect-changes.outputs.catalog }}
+          - service: cart
+            path: src/cart
+            dockerfile: src/cart/Dockerfile
+            build_args: ""
+            changed: ${{ needs.detect-changes.outputs.cart }}
+          - service: checkout
+            path: src/checkout
+            dockerfile: src/checkout/Dockerfile
+            build_args: ""
+            changed: ${{ needs.detect-changes.outputs.checkout }}
+          - service: orders
+            path: src/orders
+            dockerfile: src/orders/Dockerfile
+            build_args: ""
+            changed: ${{ needs.detect-changes.outputs.orders }}
+    
+    steps:
+      - name: Skip if no changes
+        if: matrix.changed != 'true' && github.event.inputs.force_build_all != 'true'
+        run: |
+          echo "No changes detected for ${{ matrix.service }}, skipping build"
+          exit 0
+
+      - name: Checkout code
+        if: matrix.changed == 'true' || github.event.inputs.force_build_all == 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        if: matrix.changed == 'true' || github.event.inputs.force_build_all == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials
+        if: matrix.changed == 'true' || github.event.inputs.force_build_all == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        if: matrix.changed == 'true' || github.event.inputs.force_build_all == 'true'
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create ECR repository if it doesn't exist
+        if: matrix.changed == 'true' || github.event.inputs.force_build_all == 'true'
+        run: |
+          aws ecr describe-repositories --repository-names retail-store-${{ matrix.service }} --region ${{ env.AWS_REGION }} || \
+          aws ecr create-repository --repository-name retail-store-${{ matrix.service }} --region ${{ env.AWS_REGION }} \
+            --image-scanning-configuration scanOnPush=true \
+            --encryption-configuration encryptionType=AES256
+
+      - name: Extract metadata
+        if: matrix.changed == 'true' || github.event.inputs.force_build_all == 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.ECR_REGISTRY }}/retail-store-${{ matrix.service }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        if: matrix.changed == 'true' || github.event.inputs.force_build_all == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.path }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ matrix.build_args }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Run Trivy vulnerability scanner
+        if: matrix.changed == 'true' || github.event.inputs.force_build_all == 'true'
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.ECR_REGISTRY }}/retail-store-${{ matrix.service }}:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results-${{ matrix.service }}.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        if: matrix.changed == 'true' || github.event.inputs.force_build_all == 'true'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results-${{ matrix.service }}.sarif'
+
+  # Job to run tests for changed services
+  test:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.any_changed == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - service: ui
+            path: src/ui
+            test_command: "./mvnw test"
+            setup_command: "echo 'Setting up Java environment'"
+            changed: ${{ needs.detect-changes.outputs.ui }}
+          - service: catalog
+            path: src/catalog
+            test_command: "go test ./..."
+            setup_command: "echo 'Setting up Go environment'"
+            changed: ${{ needs.detect-changes.outputs.catalog }}
+          - service: cart
+            path: src/cart
+            test_command: "./mvnw test"
+            setup_command: "echo 'Setting up Java environment'"
+            changed: ${{ needs.detect-changes.outputs.cart }}
+          - service: checkout
+            path: src/checkout
+            test_command: "yarn test"
+            setup_command: "yarn install --frozen-lockfile"
+            changed: ${{ needs.detect-changes.outputs.checkout }}
+          - service: orders
+            path: src/orders
+            test_command: "./mvnw test"
+            setup_command: "echo 'Setting up Java environment'"
+            changed: ${{ needs.detect-changes.outputs.orders }}
+
+    steps:
+      - name: Skip if no changes
+        if: matrix.changed != 'true'
+        run: |
+          echo "No changes detected for ${{ matrix.service }}, skipping tests"
+          exit 0
+
+      - name: Checkout code
+        if: matrix.changed == 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        if: matrix.changed == 'true' && (matrix.service == 'ui' || matrix.service == 'cart' || matrix.service == 'orders')
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'corretto'
+
+      - name: Set up Go
+        if: matrix.changed == 'true' && matrix.service == 'catalog'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Set up Node.js
+        if: matrix.changed == 'true' && matrix.service == 'checkout'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'yarn'
+          cache-dependency-path: ${{ matrix.path }}/yarn.lock
+
+      - name: Cache Maven dependencies
+        if: matrix.changed == 'true' && (matrix.service == 'ui' || matrix.service == 'cart' || matrix.service == 'orders')
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      - name: Cache Go modules
+        if: matrix.changed == 'true' && matrix.service == 'catalog'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Setup service dependencies
+        if: matrix.changed == 'true'
+        working-directory: ${{ matrix.path }}
+        run: ${{ matrix.setup_command }}
+
+      - name: Run tests
+        if: matrix.changed == 'true'
+        working-directory: ${{ matrix.path }}
+        run: ${{ matrix.test_command }}
+
+  # Job to update deployment manifests (if using GitOps)
+  update-manifests:
+    needs: [detect-changes, build-and-push, test]
+    if: github.ref == 'refs/heads/main' && needs.detect-changes.outputs.any_changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Kubernetes manifests
+        run: |
+          # This is a placeholder for updating Kubernetes manifests
+          # You can implement this based on your deployment strategy
+          echo "Updating Kubernetes manifests with new image tags"
+          
+          # Example: Update image tags in Helm values or Kubernetes YAML files
+          # sed -i "s|image: .*retail-store-ui.*|image: ${{ env.ECR_REGISTRY }}/retail-store-ui:${{ github.sha }}|g" k8s/ui-deployment.yaml
+          
+          # If using ArgoCD or similar GitOps tools, you might update a separate config repo
+          echo "Image tags updated successfully"
+
+  # Notification job
+  notify:
+    needs: [detect-changes, build-and-push, test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify on success
+        if: needs.build-and-push.result == 'success' && needs.test.result == 'success'
+        run: |
+          echo "✅ Pipeline completed successfully!"
+          echo "Services built and pushed to ECR"
+          
+      - name: Notify on failure
+        if: needs.build-and-push.result == 'failure' || needs.test.result == 'failure'
+        run: |
+          echo "❌ Pipeline failed!"
+          echo "Check the logs for more details"
+          exit 1
