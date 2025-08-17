@@ -96,7 +96,6 @@ jobs:
 
   # Build and push Docker images for changed services
   build-and-push:
-  build-and-push:
     needs: [detect-changes, aws-setup]
     if: needs.detect-changes.outputs.any_changed == 'true' || github.event.inputs.force_build_all == 'true'
     runs-on: ubuntu-latest
