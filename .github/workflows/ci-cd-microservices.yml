@@ -261,44 +261,189 @@ jobs:
         working-directory: ${{ matrix.path }}
         run: ${{ matrix.test_command }}
 
-  # Job to update deployment manifests (if using GitOps)
-  update-manifests:
+  # Job to update Helm chart values.yaml files with new image tags
+  update-helm-charts:
     needs: [detect-changes, build-and-push, test]
     if: github.ref == 'refs/heads/main' && needs.detect-changes.outputs.any_changed == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - service: ui
+            changed: ${{ needs.detect-changes.outputs.ui }}
+          - service: catalog
+            changed: ${{ needs.detect-changes.outputs.catalog }}
+          - service: cart
+            changed: ${{ needs.detect-changes.outputs.cart }}
+          - service: checkout
+            changed: ${{ needs.detect-changes.outputs.checkout }}
+          - service: orders
+            changed: ${{ needs.detect-changes.outputs.orders }}
+    
     steps:
+      - name: Skip if no changes
+        if: matrix.changed != 'true'
+        run: |
+          echo "No changes detected for ${{ matrix.service }}, skipping Helm chart update"
+          exit 0
+
       - name: Checkout code
+        if: matrix.changed == 'true'
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
-      - name: Update Kubernetes manifests
+      - name: Configure Git
+        if: matrix.changed == 'true'
         run: |
-          # This is a placeholder for updating Kubernetes manifests
-          # You can implement this based on your deployment strategy
-          echo "Updating Kubernetes manifests with new image tags"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Update Helm chart values.yaml
+        if: matrix.changed == 'true'
+        run: |
+          # Define the service and paths
+          SERVICE="${{ matrix.service }}"
+          VALUES_FILE="src/${SERVICE}/chart/values.yaml"
+          NEW_IMAGE_TAG="${{ github.sha }}"
+          ECR_REPOSITORY="${{ env.ECR_REGISTRY }}/retail-store-${SERVICE}"
           
-          # Example: Update image tags in Helm values or Kubernetes YAML files
-          # sed -i "s|image: .*retail-store-ui.*|image: ${{ env.ECR_REGISTRY }}/retail-store-ui:${{ github.sha }}|g" k8s/ui-deployment.yaml
+          echo "Updating Helm chart for service: ${SERVICE}"
+          echo "Values file: ${VALUES_FILE}"
+          echo "New image tag: ${NEW_IMAGE_TAG}"
+          echo "ECR repository: ${ECR_REPOSITORY}"
           
-          # If using ArgoCD or similar GitOps tools, you might update a separate config repo
-          echo "Image tags updated successfully"
+          # Check if values.yaml exists
+          if [ ! -f "${VALUES_FILE}" ]; then
+            echo "Error: ${VALUES_FILE} not found!"
+            exit 1
+          fi
+          
+          # Backup the original file
+          cp "${VALUES_FILE}" "${VALUES_FILE}.backup"
+          
+          # Update the image repository and tag in values.yaml
+          # This uses yq to properly update YAML while preserving structure and comments
+          # Install yq if not available
+          if ! command -v yq &> /dev/null; then
+            echo "Installing yq..."
+            sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            sudo chmod +x /usr/local/bin/yq
+          fi
+          
+          # Update the image repository and tag
+          yq eval ".image.repository = \"${ECR_REPOSITORY}\"" -i "${VALUES_FILE}"
+          yq eval ".image.tag = \"${NEW_IMAGE_TAG}\"" -i "${VALUES_FILE}"
+          
+          # Verify the changes
+          echo "Updated values.yaml content for image section:"
+          yq eval '.image' "${VALUES_FILE}"
+          
+          # Show the diff
+          echo "Changes made to ${VALUES_FILE}:"
+          diff "${VALUES_FILE}.backup" "${VALUES_FILE}" || true
+          
+          # Clean up backup file
+          rm "${VALUES_FILE}.backup"
+
+      - name: Validate Helm chart
+        if: matrix.changed == 'true'
+        run: |
+          SERVICE="${{ matrix.service }}"
+          CHART_PATH="src/${SERVICE}/chart"
+          
+          # Install Helm if not available
+          if ! command -v helm &> /dev/null; then
+            echo "Installing Helm..."
+            curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          fi
+          
+          # Validate the Helm chart
+          echo "Validating Helm chart for ${SERVICE}..."
+          helm lint "${CHART_PATH}"
+          
+          # Test template rendering
+          echo "Testing Helm template rendering..."
+          helm template "${SERVICE}" "${CHART_PATH}" --dry-run > /dev/null
+          
+          echo "✅ Helm chart validation successful for ${SERVICE}"
+
+      - name: Create deployment summary
+        if: matrix.changed == 'true'
+        run: |
+          SERVICE="${{ matrix.service }}"
+          NEW_IMAGE_TAG="${{ github.sha }}"
+          ECR_REPOSITORY="${{ env.ECR_REGISTRY }}/retail-store-${SERVICE}"
+          
+          echo "## 🚀 Deployment Summary for ${SERVICE}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | \`${SERVICE}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Repository | \`${ECR_REPOSITORY}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Tag | \`${NEW_IMAGE_TAG}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Helm Chart Path | \`src/${SERVICE}/chart/values.yaml\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit SHA | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Changes Made:" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Updated image repository to ECR" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Updated image tag to latest commit SHA" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Committed changes to repository" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      - name: Commit and push changes
+        if: matrix.changed == 'true'
+        run: |
+          SERVICE="${{ matrix.service }}"
+          VALUES_FILE="src/${SERVICE}/chart/values.yaml"
+          
+          # Check if there are any changes to commit
+          if git diff --quiet "${VALUES_FILE}"; then
+            echo "No changes to commit for ${SERVICE}"
+            exit 0
+          fi
+          
+          # Add and commit the changes
+          git add "${VALUES_FILE}"
+          git commit -m "chore: update ${SERVICE} Helm chart with image tag ${{ github.sha }}
+
+          - Updated image repository to ${{ env.ECR_REGISTRY }}/retail-store-${SERVICE}
+          - Updated image tag to ${{ github.sha }}
+          - Auto-generated by GitHub Actions workflow"
+          
+          # Push the changes
+          git push origin main
+          
+          echo "✅ Successfully updated Helm chart for ${SERVICE} service"
 
   # Notification job
   notify:
-    needs: [detect-changes, build-and-push, test]
+    needs: [detect-changes, build-and-push, test, update-helm-charts]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Notify on success
-        if: needs.build-and-push.result == 'success' && needs.test.result == 'success'
+        if: needs.build-and-push.result == 'success' && needs.test.result == 'success' && (needs.update-helm-charts.result == 'success' || needs.update-helm-charts.result == 'skipped')
         run: |
           echo "✅ Pipeline completed successfully!"
           echo "Services built and pushed to ECR"
+          if [ "${{ needs.update-helm-charts.result }}" == "success" ]; then
+            echo "Helm charts updated with new image tags"
+          fi
           
       - name: Notify on failure
-        if: needs.build-and-push.result == 'failure' || needs.test.result == 'failure'
+        if: needs.build-and-push.result == 'failure' || needs.test.result == 'failure' || needs.update-helm-charts.result == 'failure'
         run: |
           echo "❌ Pipeline failed!"
           echo "Check the logs for more details"
+          if [ "${{ needs.build-and-push.result }}" == "failure" ]; then
+            echo "Build and push job failed"
+          fi
+          if [ "${{ needs.test.result }}" == "failure" ]; then
+            echo "Test job failed"
+          fi
+          if [ "${{ needs.update-helm-charts.result }}" == "failure" ]; then
+            echo "Helm chart update job failed"
+          fi
           exit 1
