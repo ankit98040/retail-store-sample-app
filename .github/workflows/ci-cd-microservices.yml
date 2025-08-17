@@ -453,6 +453,7 @@ jobs:
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Service | \`${SERVICE}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| AWS Region | \`us-west-2\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Image Repository | \`${ECR_REPOSITORY}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Image Tag | \`${NEW_IMAGE_TAG}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Secondary Tag | \`main-${SHORT_SHA}\` |" >> $GITHUB_STEP_SUMMARY
@@ -460,7 +461,7 @@ jobs:
           echo "| Commit SHA | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Changes Made:" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Updated image repository to ECR" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Updated image repository to ECR (us-west-2)" >> $GITHUB_STEP_SUMMARY
           echo "- ✅ Updated image tag to latest" >> $GITHUB_STEP_SUMMARY
           echo "- ✅ Committed changes to repository" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
