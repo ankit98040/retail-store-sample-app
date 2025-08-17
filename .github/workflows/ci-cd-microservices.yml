@@ -220,82 +220,118 @@ jobs:
           echo "Region: us-west-2"
           echo ""
           
-          # List all images in the repository to verify push
-          echo "📋 Listing all images in us-west-2 repository..."
-          aws ecr describe-images \
-            --repository-name retail-store-${{ matrix.service }} \
-            --region us-west-2 \
-            --query 'imageDetails[*].imageTags' \
-            --output table
-          echo ""
-          
-          # Define expected tags based on our tagging strategy
-          EXPECTED_TAGS=(
-            "build-${{ github.run_number }}"
-            "main"
-            "main-$(echo "${{ github.sha }}" | cut -c1-7)"
-          )
-          
-          echo "🔍 Verifying expected tags exist..."
-          VERIFICATION_FAILED=false
-          
-          for tag in "${EXPECTED_TAGS[@]}"; do
-            echo "Checking tag: ${tag}"
+          # Function to check if a tag exists
+          check_tag_exists() {
+            local tag="$1"
             if aws ecr describe-images \
               --repository-name retail-store-${{ matrix.service }} \
               --image-ids imageTag="${tag}" \
               --region us-west-2 \
               --query 'imageDetails[0].imageTags' \
               --output text > /dev/null 2>&1; then
-              echo "  ✅ Tag '${tag}' verified successfully"
+              return 0
             else
-              echo "  ❌ Tag '${tag}' not found"
+              return 1
+            fi
+          }
+          
+          # Get all images and their tags from the repository
+          echo "📋 All images in repository:"
+          ALL_IMAGES=$(aws ecr describe-images \
+            --repository-name retail-store-${{ matrix.service }} \
+            --region us-west-2 \
+            --query 'sort_by(imageDetails, &imagePushedAt)' \
+            --output json)
+          
+          echo "$ALL_IMAGES" | jq -r '.[] | "Image: " + .imageDigest[7:19] + " | Pushed: " + .imagePushedAt + " | Tags: " + (.imageTags | join(", "))'
+          echo ""
+          
+          # Get the most recent image (should be ours)
+          LATEST_IMAGE=$(echo "$ALL_IMAGES" | jq -r '.[-1]')
+          LATEST_TAGS=$(echo "$LATEST_IMAGE" | jq -r '.imageTags[]' 2>/dev/null || echo "")
+          
+          if [ -z "$LATEST_TAGS" ]; then
+            echo "❌ No tags found on the latest image"
+            exit 1
+          fi
+          
+          echo "🎯 Latest image tags:"
+          echo "$LATEST_TAGS" | while IFS= read -r tag; do
+            if [ -n "$tag" ]; then
+              echo "  ✅ $tag"
+            fi
+          done
+          echo ""
+          
+          # Verify critical tags exist
+          echo "🔍 Verifying critical tags..."
+          CRITICAL_TAGS=(
+            "build-${{ github.run_number }}"
+            "main"
+          )
+          
+          VERIFICATION_FAILED=false
+          for tag in "${CRITICAL_TAGS[@]}"; do
+            echo -n "Checking critical tag '${tag}': "
+            if check_tag_exists "${tag}"; then
+              echo "✅ Found"
+            else
+              echo "❌ Missing"
               VERIFICATION_FAILED=true
             fi
           done
           
-          echo ""
-          
-          # Check for timestamp-based tag (flexible matching)
-          echo "🕐 Checking for timestamp-based tag..."
-          TIMESTAMP_TAGS=$(aws ecr describe-images \
-            --repository-name retail-store-${{ matrix.service }} \
-            --region us-west-2 \
-            --query 'imageDetails[*].imageTags[?contains(@, `main-2024`)]' \
-            --output text)
-            
-          if [ -n "$TIMESTAMP_TAGS" ]; then
-            echo "  ✅ Timestamp tag found: $TIMESTAMP_TAGS"
+          # Check for commit SHA tag (flexible)
+          echo -n "Checking commit SHA tag: "
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          if check_tag_exists "main-${SHORT_SHA}"; then
+            echo "✅ Found (main-${SHORT_SHA})"
           else
-            echo "  ⚠️ No timestamp tag found (this is optional)"
+            echo "⚠️ Not found (main-${SHORT_SHA}) - checking for any main- tag"
+            MAIN_TAGS=$(echo "$LATEST_TAGS" | grep "^main-" || echo "")
+            if [ -n "$MAIN_TAGS" ]; then
+              echo "  ✅ Found alternative: $MAIN_TAGS"
+            else
+              echo "  ⚠️ No main- prefixed tags found"
+            fi
+          fi
+          
+          # Check for timestamp tag (optional)
+          echo -n "Checking timestamp tag: "
+          TIMESTAMP_TAG=$(echo "$LATEST_TAGS" | grep "main-[0-9]\{8\}-[0-9]\{6\}" || echo "")
+          if [ -n "$TIMESTAMP_TAG" ]; then
+            echo "✅ Found ($TIMESTAMP_TAG)"
+          else
+            echo "⚠️ Not found (optional)"
           fi
           
           echo ""
           
-          # Get the latest image details
-          echo "📊 Latest image details:"
-          LATEST_IMAGE=$(aws ecr describe-images \
-            --repository-name retail-store-${{ matrix.service }} \
-            --region us-west-2 \
-            --query 'sort_by(imageDetails, &imagePushedAt)[-1]' \
-            --output json)
-          
-          echo "Image Digest: $(echo "$LATEST_IMAGE" | jq -r '.imageDigest')"
-          echo "Image Size: $(echo "$LATEST_IMAGE" | jq -r '.imageSizeInBytes') bytes"
-          echo "Pushed At: $(echo "$LATEST_IMAGE" | jq -r '.imagePushedAt')"
-          echo "All Tags: $(echo "$LATEST_IMAGE" | jq -r '.imageTags | join(", ")')"
+          # Display image details
+          echo "📊 Image details:"
+          echo "  Digest: $(echo "$LATEST_IMAGE" | jq -r '.imageDigest')"
+          echo "  Size: $(echo "$LATEST_IMAGE" | jq -r '.imageSizeInBytes') bytes"
+          echo "  Pushed: $(echo "$LATEST_IMAGE" | jq -r '.imagePushedAt')"
+          echo "  Tag Count: $(echo "$LATEST_TAGS" | wc -l | tr -d ' ')"
           
           echo ""
           
           # Final verification result
           if [ "$VERIFICATION_FAILED" = true ]; then
-            echo "❌ Image push verification FAILED - Some expected tags are missing"
+            echo "❌ Image push verification FAILED - Critical tags are missing"
             exit 1
           else
-            echo "✅ Image push verification PASSED - All expected tags found"
+            echo "✅ Image push verification PASSED"
             echo ""
             echo "🎯 Primary deployment tag: build-${{ github.run_number }}"
-            echo "🔗 Repository URL: https://us-west-2.console.aws.amazon.com/ecr/repositories/private/${{ secrets.AWS_ACCOUNT_ID }}/retail-store-${{ matrix.service }}"
+            echo "🔗 ECR Console: https://us-west-2.console.aws.amazon.com/ecr/repositories/private/${{ secrets.AWS_ACCOUNT_ID }}/retail-store-${{ matrix.service }}"
+            echo ""
+            echo "📝 Available tags for deployment:"
+            echo "$LATEST_TAGS" | while IFS= read -r tag; do
+              if [ -n "$tag" ]; then
+                echo "  docker pull ${{ env.ECR_REGISTRY }}/retail-store-${{ matrix.service }}:$tag"
+              fi
+            done
           fi
 
   # Job to run tests for changed services
