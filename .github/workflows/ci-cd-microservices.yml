@@ -175,8 +175,11 @@ jobs:
         with:
           images: ${{ env.ECR_REGISTRY }}/retail-store-${{ matrix.service }}
           tags: |
-            type=raw,value=latest
+            type=ref,event=branch
+            type=ref,event=pr
             type=sha,prefix={{branch}}-
+            type=raw,value=build-${{ github.run_number }}
+            type=raw,value={{branch}}-{{date 'YYYYMMDD-HHmmss'}}
 
       - name: Build and push Docker image
         if: matrix.changed == 'true' || github.event.inputs.force_build_all == 'true'
@@ -196,7 +199,7 @@ jobs:
         if: matrix.changed == 'true' || github.event.inputs.force_build_all == 'true'
         run: |
           echo "✅ Successfully pushed image for ${{ matrix.service }}"
-          echo "Image: ${{ env.ECR_REGISTRY }}/retail-store-${{ matrix.service }}:latest"
+          echo "Primary tag: ${{ env.ECR_REGISTRY }}/retail-store-${{ matrix.service }}:build-${{ github.run_number }}"
           echo "Region: us-west-2"
           
           # List all images in the repository to verify push
@@ -207,17 +210,17 @@ jobs:
             --query 'imageDetails[*].imageTags' \
             --output table
             
-          # Verify the latest tag specifically exists
-          echo "Verifying latest tag exists in us-west-2..."
+          # Verify the build tag specifically exists
+          echo "Verifying build-${{ github.run_number }} tag exists in us-west-2..."
           if aws ecr describe-images \
             --repository-name retail-store-${{ matrix.service }} \
-            --image-ids imageTag=latest \
+            --image-ids imageTag=build-${{ github.run_number }} \
             --region us-west-2 \
             --query 'imageDetails[0].imageTags' \
             --output text > /dev/null 2>&1; then
-            echo "✅ Latest tag verified successfully in us-west-2"
+            echo "✅ Build tag verified successfully in us-west-2"
           else
-            echo "❌ Latest tag not found in us-west-2"
+            echo "❌ Build tag not found in us-west-2"
             exit 1
           fi
           
@@ -232,7 +235,7 @@ jobs:
           if [ -n "$MAIN_TAGS" ]; then
             echo "✅ Commit SHA tag found: $MAIN_TAGS"
           else
-            echo "⚠️ No main- prefixed tag found, but latest tag exists"
+            echo "⚠️ No main- prefixed tag found, but build tag exists"
           fi
           
           echo "✅ Image push verification completed"
@@ -377,7 +380,7 @@ jobs:
           # Define the service and paths
           SERVICE="${{ matrix.service }}"
           VALUES_FILE="src/${SERVICE}/chart/values.yaml"
-          NEW_IMAGE_TAG="latest"
+          NEW_IMAGE_TAG="build-${{ github.run_number }}"
           ECR_REPOSITORY="${{ env.ECR_REGISTRY }}/retail-store-${SERVICE}"
           
           echo "Updating Helm chart for service: ${SERVICE}"
@@ -444,7 +447,7 @@ jobs:
         if: matrix.changed == 'true'
         run: |
           SERVICE="${{ matrix.service }}"
-          NEW_IMAGE_TAG="latest"
+          NEW_IMAGE_TAG="build-${{ github.run_number }}"
           ECR_REPOSITORY="${{ env.ECR_REGISTRY }}/retail-store-${SERVICE}"
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
           
@@ -455,14 +458,16 @@ jobs:
           echo "| Service | \`${SERVICE}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| AWS Region | \`us-west-2\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Image Repository | \`${ECR_REPOSITORY}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Image Tag | \`${NEW_IMAGE_TAG}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Secondary Tag | \`main-${SHORT_SHA}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Primary Tag | \`${NEW_IMAGE_TAG}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch Tag | \`main\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit Tag | \`main-${SHORT_SHA}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Number | \`${{ github.run_number }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Helm Chart Path | \`src/${SERVICE}/chart/values.yaml\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit SHA | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Changes Made:" >> $GITHUB_STEP_SUMMARY
           echo "- ✅ Updated image repository to ECR (us-west-2)" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Updated image tag to latest" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Updated image tag to build-${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
           echo "- ✅ Committed changes to repository" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
@@ -481,10 +486,11 @@ jobs:
           # Add and commit the changes
           git add "${VALUES_FILE}"
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-          git commit -m "chore: update ${SERVICE} Helm chart with latest image tag
+          git commit -m "chore: update ${SERVICE} Helm chart with build-${{ github.run_number }} image tag
 
           - Updated image repository to ${{ env.ECR_REGISTRY }}/retail-store-${SERVICE}
-          - Updated image tag to latest (commit: ${SHORT_SHA})
+          - Updated image tag to build-${{ github.run_number }} (commit: ${SHORT_SHA})
+          - Build number: ${{ github.run_number }}
           - Auto-generated by GitHub Actions workflow"
           
           # Push the changes
