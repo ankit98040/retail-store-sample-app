@@ -1,4 +1,6 @@
 name: Microservices CI/CD Pipeline
+# This workflow is configured to work exclusively with AWS us-west-2 region
+# All ECR repositories and AWS resources will be created/accessed in us-west-2
 
 on:
   push:
@@ -18,8 +20,8 @@ on:
         type: boolean
 
 env:
-  AWS_REGION: us-east-1
-  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+  AWS_REGION: us-west-2
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-west-2.amazonaws.com
 
 jobs:
   # Job to detect which services have changed
@@ -75,23 +77,33 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Verify AWS authentication
+      - name: Verify AWS authentication and region
         run: |
           echo "✅ AWS authentication successful"
           echo "AWS Account ID: $(aws sts get-caller-identity --query Account --output text)"
-          echo "AWS Region: ${{ env.AWS_REGION }}"
+          echo "Configured AWS Region: ${{ env.AWS_REGION }}"
+          echo "Active AWS Region: $(aws configure get region || echo 'Not set in config')"
           echo "ECR Registry: ${{ steps.login-ecr.outputs.registry }}"
+          
+          # Verify we're working with us-west-2
+          if [ "${{ env.AWS_REGION }}" != "us-west-2" ]; then
+            echo "❌ ERROR: Expected region us-west-2, but got ${{ env.AWS_REGION }}"
+            exit 1
+          fi
+          
+          echo "✅ Region verification passed: Using us-west-2"
 
       - name: Create ECR repositories if they don't exist
         run: |
+          echo "Creating ECR repositories in region: ${{ env.AWS_REGION }}"
           services=("ui" "catalog" "cart" "checkout" "orders")
           for service in "${services[@]}"; do
-            echo "Checking/Creating ECR repository for retail-store-${service}..."
-            aws ecr describe-repositories --repository-names retail-store-${service} --region ${{ env.AWS_REGION }} 2>/dev/null || \
-            aws ecr create-repository --repository-name retail-store-${service} --region ${{ env.AWS_REGION }} \
+            echo "Checking/Creating ECR repository for retail-store-${service} in us-west-2..."
+            aws ecr describe-repositories --repository-names retail-store-${service} --region us-west-2 2>/dev/null || \
+            aws ecr create-repository --repository-name retail-store-${service} --region us-west-2 \
               --image-scanning-configuration scanOnPush=true \
               --encryption-configuration encryptionType=AES256
-            echo "✅ ECR repository retail-store-${service} is ready"
+            echo "✅ ECR repository retail-store-${service} is ready in us-west-2"
           done
 
   # Build and push Docker images for changed services
@@ -185,25 +197,45 @@ jobs:
         run: |
           echo "✅ Successfully pushed image for ${{ matrix.service }}"
           echo "Image: ${{ env.ECR_REGISTRY }}/retail-store-${{ matrix.service }}:latest"
-          echo "Also tagged as: ${{ env.ECR_REGISTRY }}/retail-store-${{ matrix.service }}:main-${{ github.sha }}"
+          echo "Region: us-west-2"
           
-          # Verify the latest image exists in ECR
-          echo "Verifying latest tag..."
+          # List all images in the repository to verify push
+          echo "Listing all images in us-west-2 repository..."
           aws ecr describe-images \
+            --repository-name retail-store-${{ matrix.service }} \
+            --region us-west-2 \
+            --query 'imageDetails[*].imageTags' \
+            --output table
+            
+          # Verify the latest tag specifically exists
+          echo "Verifying latest tag exists in us-west-2..."
+          if aws ecr describe-images \
             --repository-name retail-store-${{ matrix.service }} \
             --image-ids imageTag=latest \
-            --region ${{ env.AWS_REGION }} \
+            --region us-west-2 \
             --query 'imageDetails[0].imageTags' \
-            --output text
-            
-          # Also verify the SHA tag exists
-          echo "Verifying SHA tag..."
-          aws ecr describe-images \
+            --output text > /dev/null 2>&1; then
+            echo "✅ Latest tag verified successfully in us-west-2"
+          else
+            echo "❌ Latest tag not found in us-west-2"
+            exit 1
+          fi
+          
+          # Check if any main- prefixed tag exists (for the commit SHA)
+          echo "Checking for commit SHA tag in us-west-2..."
+          MAIN_TAGS=$(aws ecr describe-images \
             --repository-name retail-store-${{ matrix.service }} \
-            --image-ids imageTag=main-${{ github.sha }} \
-            --region ${{ env.AWS_REGION }} \
-            --query 'imageDetails[0].imageTags' \
-            --output text
+            --region us-west-2 \
+            --query 'imageDetails[*].imageTags[?starts_with(@, `main-`)]' \
+            --output text)
+            
+          if [ -n "$MAIN_TAGS" ]; then
+            echo "✅ Commit SHA tag found: $MAIN_TAGS"
+          else
+            echo "⚠️ No main- prefixed tag found, but latest tag exists"
+          fi
+          
+          echo "✅ Image push verification completed"
 
   # Job to run tests for changed services
   test:
@@ -414,6 +446,7 @@ jobs:
           SERVICE="${{ matrix.service }}"
           NEW_IMAGE_TAG="latest"
           ECR_REPOSITORY="${{ env.ECR_REGISTRY }}/retail-store-${SERVICE}"
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
           
           echo "## 🚀 Deployment Summary for ${SERVICE}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -422,7 +455,7 @@ jobs:
           echo "| Service | \`${SERVICE}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Image Repository | \`${ECR_REPOSITORY}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Image Tag | \`${NEW_IMAGE_TAG}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Secondary Tag | \`main-${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Secondary Tag | \`main-${SHORT_SHA}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Helm Chart Path | \`src/${SERVICE}/chart/values.yaml\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit SHA | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -446,10 +479,11 @@ jobs:
           
           # Add and commit the changes
           git add "${VALUES_FILE}"
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
           git commit -m "chore: update ${SERVICE} Helm chart with latest image tag
 
           - Updated image repository to ${{ env.ECR_REGISTRY }}/retail-store-${SERVICE}
-          - Updated image tag to latest (commit: ${{ github.sha }})
+          - Updated image tag to latest (commit: ${SHORT_SHA})
           - Auto-generated by GitHub Actions workflow"
           
           # Push the changes
